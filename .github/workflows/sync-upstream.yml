@@ -1,0 +1,126 @@
+# 將此 fork 的預設分支與上游（parent）的預設分支合併。
+#
+# 排程為每天 19:00 UTC，也就是台灣時間 03:00（Asia/Taipei，UTC+8，無日光節約時間）。
+# GitHub Actions 的 cron 一律以 UTC 計算，高負載時可能稍晚幾分鐘才啟動。
+#
+# 同步方式：
+# - 呼叫 GitHub 的 merge-upstream API。這與網頁上「Sync fork → Update branch」，
+#   以及不帶 --force 的 `gh repo sync` 所走的合併路徑相同。
+# - 只把上游的預設分支合併進此 fork 的預設分支，保留此 fork 自己的提交與新增檔案。
+# - 不使用 --force，也不呼叫 git refs API，因此不會強制推送，也不會丟棄檔案。
+# - 合併衝突（HTTP 409）時讓這個工作流程失敗，並開一則 issue，而不是覆寫。
+# - 若上游改到 .github/workflows 底下的檔案，GITHUB_TOKEN 無法寫入 workflow，
+#   API 會回 HTTP 422。這種情況同樣失敗並停止，不會改走強制推送。
+
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into the default branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the upstream default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          parent=$(gh api "repos/${REPO}" --jq '.parent.full_name // empty')
+          branch=$(gh api "repos/${REPO}" --jq '.default_branch // empty')
+
+          if [ -z "${parent}" ]; then
+            echo "::error::此倉庫不是 fork，找不到上游 parent，已停止。"
+            exit 1
+          fi
+          if [ -z "${branch}" ]; then
+            echo "::error::找不到此倉庫的預設分支，已停止。"
+            exit 1
+          fi
+
+          upstream_branch=$(gh api "repos/${parent}" --jq '.default_branch' 2>/dev/null || true)
+
+          echo "上游：${parent}（預設分支 ${upstream_branch:-未知}）"
+          echo "此 fork 的預設分支：${branch}"
+          if [ -n "${upstream_branch}" ] && [ "${upstream_branch}" != "${branch}" ]; then
+            echo "兩邊的預設分支名稱不同。merge-upstream 會把上游的預設分支 ${upstream_branch} 合併進此 fork 的 ${branch}。"
+          fi
+          echo "使用 merge-upstream API 合併。不使用 --force，也不更新 git ref。"
+
+          err_file=$(mktemp)
+          set +e
+          body=$(gh api --method POST "repos/${REPO}/merge-upstream" -f "branch=${branch}" 2>"${err_file}")
+          status_code=$?
+          set -e
+          cat "${err_file}" >&2 || true
+          printf '%s\n' "${body}"
+
+          if [ "${status_code}" -eq 0 ]; then
+            merge_type=$(printf '%s' "${body}" | jq -r '.merge_type // "unknown"')
+            message=$(printf '%s' "${body}" | jq -r '.message // empty')
+            echo "同步完成（merge_type=${merge_type}）。${message}"
+            echo "此 fork 既有的提交與檔案都保留。"
+            exit 0
+          fi
+
+          message=$(printf '%s' "${body}" | jq -r '.message // empty' 2>/dev/null || true)
+          http_status=$(printf '%s' "${body}" | jq -r '.status // empty' 2>/dev/null || true)
+          if [ -z "${http_status}" ]; then
+            http_status=$(awk 'match($0, /HTTP [0-9][0-9][0-9]/) { print substr($0, RSTART + 5, 3); exit }' "${err_file}" || true)
+          fi
+          if [ -z "${message}" ]; then
+            message=$(sed -n 's/^gh: \(.*\) (HTTP [0-9][0-9][0-9])$/\1/p' "${err_file}" | awk 'NR==1{print; exit}' || true)
+          fi
+          run_url="${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}"
+
+          if [ "${http_status}" = "409" ] || printf '%s' "${message}" | grep -qi 'merge conflict'; then
+            echo "::error::與上游合併時發生衝突，已停止。沒有強制推送，也沒有覆寫此 fork 的檔案。"
+            title="上游同步發生合併衝突"
+            existing=$(gh issue list --repo "${REPO}" --state open --limit 100 --json number,title \
+              | jq -r --arg t "${title}" '[.[] | select(.title == $t) | .number] | first // empty' || true)
+            note_file=$(mktemp)
+            if [ -n "${existing}" ]; then
+              printf '%s\n' \
+                "再次同步仍然發生合併衝突，工作流程已停止，沒有覆寫任何檔案。" \
+                "" \
+                "- 執行紀錄：${run_url}" \
+                > "${note_file}"
+              gh issue comment "${existing}" --repo "${REPO}" --body-file "${note_file}" \
+                || echo "::warning::無法在既有的衝突 issue 留言。"
+            else
+              printf '%s\n' \
+                "這個 fork 在自動合併上游時發生衝突，同步已停止。" \
+                "" \
+                "沒有使用 force push，也沒有覆寫本倉庫自己新增的檔案。" \
+                "" \
+                "請手動把上游合併進來並解決衝突。不要使用 \`git push --force\` 或 \`gh repo sync --force\`，那會丟掉此 fork 獨有的內容，例如 \`README.zh-TW.md\`。" \
+                "" \
+                "- 上游：\`${parent}\`（預設分支 \`${upstream_branch:-未知}\`）" \
+                "- 本倉庫預設分支：\`${branch}\`" \
+                "- 執行紀錄：${run_url}" \
+                "- API 訊息：${message}" \
+                > "${note_file}"
+              gh issue create --repo "${REPO}" --title "${title}" --body-file "${note_file}" \
+                || echo "::warning::無法建立衝突 issue。同步仍然視為失敗。"
+            fi
+            exit 1
+          fi
+
+          echo "::error::上游同步失敗（HTTP ${http_status:-未知}）：${message:-請看上方日誌}"
+          if printf '%s' "${message}" | grep -qi 'workflow'; then
+            echo "::error::上游這次的變更含有 workflow 檔。GITHUB_TOKEN 不能寫入 .github/workflows，因此整次合併被拒絕。請用具有 workflow 權限的身分手動同步。此工作流程不會改走 force push。"
+          fi
+          exit 1
